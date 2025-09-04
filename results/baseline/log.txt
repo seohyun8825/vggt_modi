@@ -1,0 +1,13 @@
+{
+  "experiment": {
+    "mask_type": "none",
+    "topk_neighbors": 0,
+    "mutual": true,
+    "soft_mask": false,
+    "mask_hub_tokens": false
+  },
+  "runtime_s": 2.237053632736206,
+  "peak_VRAM_GB": 12.517378807067871,
+  "pose_AUC": null,
+  "depth_RMSE": null
+}

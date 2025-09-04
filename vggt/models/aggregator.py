@@ -68,6 +68,12 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        # Masked global attention config
+        mask_type: str = "none",  # ["none", "topk", "soft"]
+        topk_neighbors: int = 0,
+        mutual: bool = True,
+        soft_mask: bool = False,
+        mask_hub_tokens: bool = False,
     ):
         super().__init__()
 
@@ -139,6 +145,17 @@ class Aggregator(nn.Module):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
         self.use_reentrant = False # hardcoded to False
+
+        # Masking configuration
+        self.mask_type = mask_type
+        self.topk_neighbors = int(topk_neighbors)
+        self.mutual = bool(mutual)
+        # allow both flags; if mask_type=="soft" and soft_mask is False, enable soft
+        self.soft_mask = bool(soft_mask) or (mask_type == "soft")
+        self.mask_hub_tokens = bool(mask_hub_tokens)
+        # placeholders for externally-provided adjacency/bias (per-call override)
+        self._next_adjacency: Optional[torch.Tensor] = None  # (S, S) bool or float weights
+        self._next_bias: Optional[torch.Tensor] = None       # (S, S) float additive bias
 
     def __build_patch_embed__(
         self,
@@ -293,16 +310,164 @@ class Aggregator(nn.Module):
 
         intermediates = []
 
+        # Build additive attention bias (broadcastable to [B, H, N, N]) if masking is enabled
+        attn_bias = self._build_global_attn_bias(B, S, P, device=tokens.device, dtype=tokens.dtype)
+
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(
+                    self.global_blocks[global_idx], tokens, pos, attn_bias, use_reentrant=self.use_reentrant
+                )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_bias)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
+
+    # --- Masking utilities ---
+    def set_next_adjacency(self, adjacency: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None):
+        """
+        Optionally set an external adjacency or bias to be used for the next forward pass only.
+        - adjacency: (S, S) bool or float weights; True/positive means allowed/strong.
+        - bias: (S, S) float additive attention bias (e.g., from similarities).
+        After one use, these will be cleared.
+        """
+        self._next_adjacency = adjacency
+        self._next_bias = bias
+
+    def _compute_frame_adjacency(self, S: int, device: torch.device) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Returns (adjacency_bool_or_weights, bias_float) both of shape (S, S) or (None, None) if no masking.
+        """
+        if self.mask_type == "none" or S == 1:
+            # No mask
+            return None, None
+
+        # If provided externally, use and clear
+        if self._next_adjacency is not None or self._next_bias is not None:
+            adj = self._next_adjacency
+            bias = self._next_bias
+            self._next_adjacency, self._next_bias = None, None
+            # Ensure diagonal allowed
+            if adj is not None:
+                adj = adj.to(device)
+                if adj.dtype == torch.bool:
+                    adj = adj.clone()
+                    adj.fill_diagonal_(True)
+                else:
+                    # weights: enforce self weight = max
+                    diag_val = adj.max() if adj.numel() > 0 else torch.tensor(0.0, device=device)
+                    adj = adj.clone()
+                    adj.fill_diagonal_(diag_val)
+            if bias is not None:
+                bias = bias.to(device)
+            return adj, bias
+
+        # Default adjacency from index-based neighbors (fallback when no external graph is given)
+        # Build directed top-k by temporal index distance
+        if self.mask_type in ("topk", "soft") or self.soft_mask:
+            K = max(int(self.topk_neighbors), 0)
+            idx = torch.arange(S, device=device)
+            adj = torch.zeros(S, S, dtype=torch.bool, device=device)
+            for i in range(S):
+                # choose neighbors by sorted absolute index distance excluding itself
+                d = torch.abs(idx - i)
+                # exclude itself
+                order = torch.argsort(d)
+                # neighbors (skip first which is itself)
+                neigh = order[1 : 1 + K] if K > 0 else torch.tensor([], device=device, dtype=torch.long)
+                adj[i, i] = True
+                if K > 0:
+                    adj[i, neigh] = True
+            if self.mutual and K > 0:
+                adj = adj & adj.t()
+        else:
+            adj = None
+
+        bias = None
+        if self.mask_type == "soft" or self.soft_mask:
+            # derive a simple similarity-based bias: higher similarity -> 0, lower -> negative
+            # Here we approximate similarity by inverse of index distance
+            i = torch.arange(S, device=device).view(-1, 1)
+            j = torch.arange(S, device=device).view(1, -1)
+            dist = (i - j).abs().clamp(min=0)
+            sim = 1.0 / (1.0 + dist.float())  # in (0,1]
+            sim = sim / sim.max()  # normalize to (0,1]
+            # Convert to additive bias in logit space: map sim in (0,1] to bias in [-alpha, 0]
+            alpha = 2.0  # strength of down-weighting
+            bias = -alpha * (1.0 - sim)
+            # Ensure self is zero bias
+            bias.fill_diagonal_(0.0)
+            if adj is not None and self.topk_neighbors > 0:
+                # if topk also requested, zero out bias for non-adj pairs by setting strong negative
+                not_adj = ~adj
+                bias = bias.masked_fill(not_adj, float('-inf'))
+
+        return adj, bias
+
+    def _build_global_attn_bias(
+        self, B: int, S: int, P: int, device: torch.device, dtype: torch.dtype
+    ) -> Optional[torch.Tensor]:
+        """
+        Build an additive attention bias of shape [1, 1, N, N] where N=S*P, or None if no masking.
+        - Hard mask: entries set to -inf for disallowed pairs
+        - Soft mask: entries store negative penalties based on pairwise similarity
+        Also supports masking hub/register tokens from cross-frame interactions.
+        """
+        adj, frame_bias = self._compute_frame_adjacency(S, device)
+        if adj is None and frame_bias is None:
+            return None
+
+        N = S * P
+        # Map token -> frame index and identify register tokens per frame
+        frame_ids = torch.arange(S, device=device).repeat_interleave(P)
+        # token indices within a frame [0..P-1]
+        t_in_frame = torch.arange(P, device=device).repeat(S)
+        num_register_tokens = self.patch_start_idx - 1  # indices [1 .. patch_start_idx-1]
+        is_register = (t_in_frame >= 1) & (t_in_frame < self.patch_start_idx)
+
+        # Start with allowed pairs from adjacency
+        if adj is None:
+            allowed = torch.ones(S, S, dtype=torch.bool, device=device)
+        else:
+            allowed = adj.to(torch.bool)
+        allowed_pairs = allowed[frame_ids[:, None], frame_ids[None, :]]  # (N, N)
+
+        # Apply hub/register masking across frames if requested
+        if self.mask_hub_tokens:
+            cross = frame_ids[:, None] != frame_ids[None, :]
+            hub_cross = cross & (is_register[:, None] | is_register[None, :])
+            allowed_pairs = allowed_pairs & (~hub_cross)
+
+        # Build additive bias
+        attn_bias = torch.zeros(N, N, dtype=torch.float32, device=device)
+        # Hard mask for disallowed pairs
+        if not (self.mask_type == "soft" or self.soft_mask):
+            attn_bias = attn_bias.masked_fill(~allowed_pairs, float('-inf'))
+        else:
+            # Soft bias from frame-level similarity (broadcast to tokens)
+            if frame_bias is None:
+                # default small penalty for non-adjacent frames
+                fb = torch.zeros(S, S, dtype=torch.float32, device=device)
+            else:
+                fb = frame_bias.to(torch.float32)
+            token_bias = fb[frame_ids[:, None], frame_ids[None, :]]  # (N, N)
+            attn_bias = attn_bias + token_bias
+            # if also not allowed by adjacency (when combining topk + soft), enforce hard mask
+            if adj is not None and self.topk_neighbors > 0:
+                attn_bias = attn_bias.masked_fill(~allowed_pairs, float('-inf'))
+
+            if self.mask_hub_tokens:
+                # ensure hub cross-frame is strictly masked
+                cross = frame_ids[:, None] != frame_ids[None, :]
+                hub_cross = cross & (is_register[:, None] | is_register[None, :])
+                attn_bias = attn_bias.masked_fill(hub_cross, float('-inf'))
+
+        # Reshape to [1, 1, N, N] for broadcast across batch and heads
+        attn_bias = attn_bias.view(1, 1, N, N)
+        return attn_bias
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

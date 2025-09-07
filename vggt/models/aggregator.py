@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
+from vggt.layers.attention import GlobalSparseAttention
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
 
@@ -112,6 +113,7 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    attn_class=GlobalSparseAttention,
                 )
                 for _ in range(depth)
             ]
@@ -310,19 +312,107 @@ class Aggregator(nn.Module):
 
         intermediates = []
 
-        # Build additive attention bias (broadcastable to [B, H, N, N]) if masking is enabled
-        attn_bias = self._build_global_attn_bias(B, S, P, device=tokens.device, dtype=tokens.dtype)
+        # Build sparse attention context (no NxN allocation)
+        # Frame-level adjacency and bias (S,S)
+        adj, frame_bias = self._compute_frame_adjacency(S, device=tokens.device)
+
+        # Token -> frame mapping and hub tokens
+        N = S * P
+        frame_ids = torch.arange(S, device=tokens.device).repeat_interleave(P)  # (N,)
+        t_in_frame = torch.arange(P, device=tokens.device).repeat(S)            # (N,)
+        is_register = (t_in_frame >= 1) & (t_in_frame < self.patch_start_idx)
+        # Treat camera(token 0) and register tokens as hubs for optional masking
+        is_hub = is_register | (t_in_frame == 0)
+
+        # Telemetry to detect flex usage inside attention kernel
+        telemetry: Dict[str, Any] = {"used_flex_attention": False, "used_sparse_context": False}
+
+        sparse_ctx = {
+            'adj': adj,                      # (S,S) bool or None
+            'frame_ids': frame_ids,          # (N,)
+            'is_hub': is_hub,                # (N,)
+            'mask_hub_tokens': self.mask_hub_tokens,
+            'soft_mask': (self.mask_type == "soft") or self.soft_mask,
+            'frame_bias': frame_bias,        # (S,S) float or None (for soft)
+            'telemetry': telemetry,
+        }
+
+        # Precompute sparsity metrics for logging
+        total_pairs = int(N) * int(N)
+        hubs_per_frame = int(self.patch_start_idx)  # 1 camera + num_register_tokens
+        nonhub_per_frame = max(int(P) - hubs_per_frame, 0)
+
+        if adj is None:
+            # All frames connected (soft-only or no topk)
+            if self.mask_hub_tokens:
+                # intra-frame fully allowed + cross-frame nonhub only
+                allowed_intra = S * (P * P)
+                allowed_cross = S * (S - 1) * (nonhub_per_frame * nonhub_per_frame)
+                allowed_pairs = allowed_intra + allowed_cross
+            else:
+                allowed_pairs = total_pairs
+            adj_density = 1.0
+        else:
+            # Count directed frame pairs (i,j)
+            adj_bool = adj.to(torch.bool)
+            adj_density = (adj_bool.float().mean()).item()
+            # include self-edges explicitly (should already be True)
+            # Sum over all (i,j)
+            num_allowed = 0
+            for i in range(S):
+                for j in range(S):
+                    if i == j:
+                        num_allowed += (P * P)
+                    elif adj_bool[i, j]:
+                        if self.mask_hub_tokens:
+                            num_allowed += (nonhub_per_frame * nonhub_per_frame)
+                        else:
+                            num_allowed += (P * P)
+            allowed_pairs = int(num_allowed)
+
+        sparsity = float(allowed_pairs) / float(total_pairs) if total_pairs > 0 else 1.0
+        self.last_sparsity_info = {
+            "S": int(S),
+            "P": int(P),
+            "N": int(N),
+            "hubs_per_frame": hubs_per_frame,
+            "nonhub_per_frame": nonhub_per_frame,
+            "total_pairs": total_pairs,
+            "allowed_pairs": int(allowed_pairs),
+            "sparsity": float(sparsity),
+            "adj_density": float(adj_density),
+            "mask_type": self.mask_type,
+            "topk_neighbors": int(self.topk_neighbors),
+            "mutual": bool(self.mutual),
+            "soft_mask": bool((self.mask_type == "soft") or self.soft_mask),
+            "mask_hub_tokens": bool(self.mask_hub_tokens),
+            "used_flex_attention": False,  # to be updated by telemetry after forward
+        }
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
+            # Only pass sparse_ctx when masking is actually active; otherwise None keeps baseline path
+            masking_active = (
+                (adj is not None)
+                or self.mask_hub_tokens
+                or ((self.mask_type == "soft") or self.soft_mask)
+            )
+
+            ctx = sparse_ctx if masking_active else None
+
             if self.training:
                 tokens = checkpoint(
-                    self.global_blocks[global_idx], tokens, pos, attn_bias, use_reentrant=self.use_reentrant
+                    self.global_blocks[global_idx], tokens, pos, ctx, use_reentrant=self.use_reentrant
                 )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_bias)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=ctx)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
+
+        # Record telemetry (whether flex attention was actually used)
+        if hasattr(self, "last_sparsity_info") and isinstance(self.last_sparsity_info, dict):
+            self.last_sparsity_info["used_flex_attention"] = bool(telemetry.get("used_flex_attention", False))
+            self.last_sparsity_info["used_sparse_context"] = bool(telemetry.get("used_sparse_context", False))
 
         return tokens, global_idx, intermediates
 
@@ -369,20 +459,21 @@ class Aggregator(nn.Module):
         # Build directed top-k by temporal index distance
         if self.mask_type in ("topk", "soft") or self.soft_mask:
             K = max(int(self.topk_neighbors), 0)
-            idx = torch.arange(S, device=device)
-            adj = torch.zeros(S, S, dtype=torch.bool, device=device)
-            for i in range(S):
-                # choose neighbors by sorted absolute index distance excluding itself
-                d = torch.abs(idx - i)
-                # exclude itself
-                order = torch.argsort(d)
-                # neighbors (skip first which is itself)
-                neigh = order[1 : 1 + K] if K > 0 else torch.tensor([], device=device, dtype=torch.long)
-                adj[i, i] = True
-                if K > 0:
+            if K > 0:
+                idx = torch.arange(S, device=device)
+                adj = torch.zeros(S, S, dtype=torch.bool, device=device)
+                for i in range(S):
+                    # choose neighbors by sorted absolute index distance excluding itself
+                    d = torch.abs(idx - i)
+                    order = torch.argsort(d)
+                    neigh = order[1 : 1 + K]
+                    adj[i, i] = True
                     adj[i, neigh] = True
-            if self.mutual and K > 0:
-                adj = adj & adj.t()
+                if self.mutual:
+                    adj = adj & adj.t()
+            else:
+                # No hard neighbor limit -> allow all pairs (handled via soft bias only)
+                adj = None
         else:
             adj = None
 

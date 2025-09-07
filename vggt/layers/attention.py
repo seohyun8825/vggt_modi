@@ -10,6 +10,7 @@
 import logging
 import os
 import warnings
+import math
 
 from torch import Tensor
 from torch import nn
@@ -100,3 +101,103 @@ class MemEffAttention(Attention):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+
+class GlobalSparseAttention(Attention):
+    """
+    Global attention that supports true sparsification via PyTorch FlexAttention.
+
+    Usage:
+      - If attn_mask is a dict context with keys:
+          { 'adj': (S,S) bool or None,
+            'frame_ids': (L,) int64,
+            'is_hub': (L,) bool,
+            'mask_hub_tokens': bool,
+            'soft_mask': bool,
+            'frame_bias': (S,S) float32 or None }
+        it will run flex_attention with a score_mod that skips disallowed pairs
+        and adds frame-level bias without creating an NxN dense mask.
+
+      - Otherwise, falls back to base Attention (SDPA path).
+    """
+
+    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:  # type: ignore[override]
+        # Detect whether we received a sparse context dict
+        use_sparse = isinstance(attn_mask, dict)
+
+        if not use_sparse:
+            return super().forward(x, pos=pos, attn_mask=attn_mask)
+
+        # Build q, k, v first (rope aware, same as base)
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.rope is not None:
+            q = self.rope(q, pos)
+            k = self.rope(k, pos)
+
+        # Try to import flex_attention lazily
+        telemetry = None
+        try:
+            from torch.nn.attention import flex_attention as _flex_attention
+            telemetry = attn_mask.get('telemetry', None)
+            if isinstance(telemetry, dict):
+                telemetry['used_sparse_context'] = True
+                telemetry['used_flex_attention'] = True
+        except Exception:
+            # Flex not available -> fallback to dense SDPA without mask
+            telemetry = attn_mask.get('telemetry', None)
+            if isinstance(telemetry, dict):
+                telemetry['used_sparse_context'] = True
+                telemetry['used_flex_attention'] = False
+            return super().forward(x, pos=pos, attn_mask=None)
+
+        # Extract sparse context
+        ctx = attn_mask
+        adj = ctx.get('adj', None)              # (S,S) bool or None
+        frame_ids = ctx.get('frame_ids', None)  # (L,) int64
+        is_hub = ctx.get('is_hub', None)        # (L,) bool
+        mask_hub_tokens = bool(ctx.get('mask_hub_tokens', False))
+        soft_mask = bool(ctx.get('soft_mask', False))
+        frame_bias = ctx.get('frame_bias', None)  # (S,S) float or None
+
+        if frame_ids is None or is_hub is None:
+            # Not enough info, fallback
+            if isinstance(telemetry, dict):
+                telemetry['used_sparse_context'] = True
+                telemetry['used_flex_attention'] = False
+            return super().forward(x, pos=pos, attn_mask=None)
+
+        # Ensure dtypes/devices
+        device = q.device
+        frame_ids = frame_ids.to(device)
+        is_hub = is_hub.to(device)
+        if adj is not None:
+            adj = adj.to(device)
+        if frame_bias is not None:
+            frame_bias = frame_bias.to(device)
+
+        # Define score modifier to skip non-neighbor pairs and add bias without NxN allocation
+        def score_mod(score, b: int, h: int, qi: int, kj: int):
+            fi = frame_ids[qi]
+            fj = frame_ids[kj]
+            allow = True
+            if adj is not None:
+                allow = bool(adj[fi, fj])
+            if allow and mask_hub_tokens and (fi != fj) and (bool(is_hub[qi]) or bool(is_hub[kj])):
+                allow = False
+            if not allow:
+                return -math.inf
+            if soft_mask and (frame_bias is not None):
+                # frame_bias holds additive penalties (usually <= 0)
+                return score + frame_bias[fi, fj]
+            return score
+
+        # Run flex attention. It expects [B, H, N, Dh]
+        out = _flex_attention(q, k, v, score_mod=score_mod)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out

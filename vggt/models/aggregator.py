@@ -560,6 +560,85 @@ class Aggregator(nn.Module):
         attn_bias = attn_bias.view(1, 1, N, N)
         return attn_bias
 
+    # --- External adjacency helpers (for MegaLoc integration) ---
+    def set_next_adjacency_from_json(self, json_path: str, image_paths: list[str]):
+        """
+        Load an external co-occurrence graph from JSON for the next forward pass.
+        Accepts either:
+          - {"adjacency": [[0/1,...], ...]} shape SxS
+          - {"bias": [[float,...], ...]} shape SxS (soft mask bias)
+          - {"neighbors": {"basename": ["neighbor_basename", ...], ...}} (optionally weighted)
+            • Also supports {"neighbors": {"basename": {"nbr": weight, ...}}}
+        image_paths are used to map basenames to indices 0..S-1 in order.
+        """
+        try:
+            import json, os
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        S = len(image_paths)
+        # Map basenames
+        bases = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
+        index_of = {b: i for i, b in enumerate(bases)}
+
+        adj_tensor = None
+        bias_tensor = None
+
+        if isinstance(data, dict) and 'adjacency' in data:
+            import torch as _torch
+            A = data['adjacency']
+            try:
+                adj_tensor = _torch.tensor(A, dtype=_torch.bool, device=self.camera_token.device)
+            except Exception:
+                pass
+        if isinstance(data, dict) and 'bias' in data:
+            import torch as _torch
+            B = data['bias']
+            try:
+                bias_tensor = _torch.tensor(B, dtype=_torch.float32, device=self.camera_token.device)
+            except Exception:
+                pass
+        if isinstance(data, dict) and 'neighbors' in data and (adj_tensor is None or bias_tensor is None):
+            import torch as _torch
+            nbrs = data['neighbors']
+            # Initialize only if missing
+            if adj_tensor is None:
+                adj_tensor = _torch.zeros(S, S, dtype=_torch.bool, device=self.camera_token.device)
+            if bias_tensor is None and self.soft_mask:
+                bias_tensor = _torch.zeros(S, S, dtype=_torch.float32, device=self.camera_token.device)
+            for bname, neigh in nbrs.items():
+                if bname not in index_of:
+                    continue
+                i = index_of[bname]
+                # neigh can be list[str] or dict[str->float]
+                if isinstance(neigh, dict):
+                    for nb, w in neigh.items():
+                        j = index_of.get(nb, None)
+                        if j is None:
+                            continue
+                        adj_tensor[i, j] = True
+                        if bias_tensor is not None:
+                            try:
+                                bias_tensor[i, j] = float(w)
+                            except Exception:
+                                pass
+                elif isinstance(neigh, list):
+                    for nb in neigh:
+                        j = index_of.get(nb, None)
+                        if j is None:
+                            continue
+                        adj_tensor[i, j] = True
+
+        # Enforce self-connections
+        if adj_tensor is not None:
+            adj_tensor = adj_tensor.clone()
+            adj_tensor.fill_diagonal_(True)
+
+        # Set for next call
+        self.set_next_adjacency(adjacency=adj_tensor, bias=bias_tensor)
+
 
 def slice_expand_and_flatten(token_tensor, B, S):
     """

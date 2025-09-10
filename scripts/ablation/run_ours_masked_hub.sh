@@ -3,6 +3,8 @@ set -euo pipefail
 
 IMAGE_DIR=${1:-"examples/kitchen/images"}
 OUTPUT_DIR=${2:-"results/ours_masked_hub"}
+CO3D_DIR=${3:-"/workspace/toddler/vggt/co3d_annotations_full"}
+CO3D_ANNO_DIR=${4:-"/workspace/toddler/vggt/co3d_annotations_full"}
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -13,5 +15,9 @@ python tools/run_ablation.py \
   --topk_neighbors 8 \
   --mutual true \
   --mask_hub_tokens true \
+  --eval_co3d 1 \
+  --co3d_dir "$CO3D_DIR" \
+  --co3d_anno_dir "$CO3D_ANNO_DIR" \
+  --fast_eval 1 \
   2>&1 | tee "$OUTPUT_DIR/log.txt"
 

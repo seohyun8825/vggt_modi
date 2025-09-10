@@ -204,6 +204,15 @@ def setup_args():
     parser.add_argument('--co3d_anno_dir', type=str, required=True, help='Path to CO3D annotations')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for reproducibility')
     parser.add_argument('--model_path', type=str, required=True, help='Path to the VGGT model checkpoint')
+    # Ablation flags (so eval uses same method as run_ablation)
+    parser.add_argument('--mask_type', type=str, default='none', choices=['none','topk','soft'], help='Global attention masking mode')
+    parser.add_argument('--topk_neighbors', type=int, default=0, help='Top-K neighbors for masking')
+    parser.add_argument('--mutual', type=lambda x: str(x).lower() in ["1", "true", "yes"], default=True, help='Use mutual neighbors')
+    parser.add_argument('--soft_mask', type=lambda x: str(x).lower() in ["1", "true", "yes"], default=False, help='Enable soft masking (additive bias)')
+    parser.add_argument('--mask_hub_tokens', type=lambda x: str(x).lower() in ["1", "true", "yes"], default=False, help='Disable cross-frame hub/register attention')
+    # Optional JSON dump
+    parser.add_argument('--json_out', type=str, default=None, help='Path to write summary JSON (AUCs etc.)')
+    parser.add_argument('--adjacency_json', type=str, default=None, help='Path to per-sequence adjacency JSON (optional)')
     return parser.parse_args()
 
 
@@ -279,6 +288,8 @@ def process_sequence(model, seq_name, seq_data, category, co3d_dir, min_num_imag
 
     # Random sample num_frames images
     ids = np.random.choice(len(metadata), num_frames, replace=False)
+    # 중요: 순서를 정렬해 인접 프레임이 이웃 인덱스가 되도록 유지
+    ids = np.sort(ids)
     print("Image ids", ids)
 
     image_names = [os.path.join(co3d_dir, metadata[i]["filepath"]) for i in ids]
@@ -293,20 +304,20 @@ def process_sequence(model, seq_name, seq_data, category, co3d_dir, min_num_imag
         except Exception as e:
             print(f"BA failed with error: {e}. Falling back to standard VGGT inference.")
             with torch.no_grad():
-                with torch.cuda.amp.autocast(dtype=dtype):
+                with torch.amp.autocast("cuda", dtype=dtype):
                     predictions = model(images)
-            with torch.cuda.amp.autocast(dtype=torch.float64):
+            with torch.amp.autocast("cuda", dtype=torch.float64):
                 extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
                 pred_extrinsic = extrinsic[0]
     else:
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=dtype):
+            with torch.amp.autocast("cuda", dtype=dtype):
                 predictions = model(images)
-        with torch.cuda.amp.autocast(dtype=torch.float64):
+        with torch.amp.autocast("cuda", dtype=torch.float64):
             extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
             pred_extrinsic = extrinsic[0]
 
-    with torch.cuda.amp.autocast(dtype=torch.float64):
+    with torch.amp.autocast("cuda", dtype=torch.float64):
         gt_extrinsic = torch.from_numpy(gt_extri).to(device)
         add_row = torch.tensor([0, 0, 0, 1], device=device).expand(pred_extrinsic.size(0), 1, 4)
 
@@ -336,6 +347,20 @@ def main():
 
     # Load model
     model = load_model(device, model_path=args.model_path)
+    # Apply ablation (same behavior as run_ablation)
+    agg = model.aggregator
+    agg.mask_type = args.mask_type
+    agg.topk_neighbors = args.topk_neighbors
+    agg.mutual = args.mutual
+    agg.soft_mask = args.soft_mask or (args.mask_type == "soft")
+    agg.mask_hub_tokens = args.mask_hub_tokens
+
+    # Optional external adjacency JSON
+    if getattr(args, 'adjacency_json', None):
+        # We will set per-sequence below when image names are known
+        external_adj_json = args.adjacency_json
+    else:
+        external_adj_json = None
 
     # Set random seeds
     set_random_seeds(args.seed)
@@ -391,6 +416,17 @@ def main():
             if args.debug and not os.path.exists(os.path.join(args.co3d_dir, category, seq_name)):
                 print(f"Skipping {seq_name} (not found)")
                 continue
+
+            # Resolve image paths for the sequence (sequence data stores relative filepaths)
+            try:
+                image_names = [os.path.join(args.co3d_dir, item["filepath"]) for item in seq_data]
+            except Exception:
+                image_names = []
+            if external_adj_json:
+                try:
+                    model.aggregator.set_next_adjacency_from_json(external_adj_json, image_names)
+                except Exception:
+                    pass
 
             seq_rError, seq_tError = process_sequence(
                 model, seq_name, seq_data, category, args.co3d_dir,
@@ -454,6 +490,42 @@ def main():
         print("-"*50)
         print(f"Mean AUC: {mean_AUC_30:.4f} (AUC@30), {mean_AUC_15:.4f} (AUC@15), {mean_AUC_5:.4f} (AUC@5), {mean_AUC_3:.4f} (AUC@3)")
     print(args.model_path)
+    # Write JSON summary if requested
+    if args.json_out:
+        try:
+            summary = {
+                "per_category": {
+                    category: {
+                        "Auc_30": float(per_category_results[category]["Auc_30"]),
+                        "Auc_15": float(per_category_results[category]["Auc_15"]),
+                        "Auc_5": float(per_category_results[category]["Auc_5"]),
+                        "Auc_3": float(per_category_results[category]["Auc_3"]),
+                    } for category in sorted(per_category_results.keys())
+                } if per_category_results else {},
+                "mean": {
+                    "Auc_30": float(mean_AUC_30) if per_category_results else None,
+                    "Auc_15": float(mean_AUC_15) if per_category_results else None,
+                    "Auc_5": float(mean_AUC_5) if per_category_results else None,
+                    "Auc_3": float(mean_AUC_3) if per_category_results else None,
+                },
+                "config": {
+                    "model_path": args.model_path,
+                    "seed": args.seed,
+                    "fast_eval": args.fast_eval,
+                    "use_ba": args.use_ba,
+                    "masking": {
+                        "mask_type": args.mask_type,
+                        "topk_neighbors": args.topk_neighbors,
+                        "mutual": args.mutual,
+                        "soft_mask": args.soft_mask,
+                        "mask_hub_tokens": args.mask_hub_tokens,
+                    }
+                }
+            }
+            with open(args.json_out, "w") as f:
+                json.dump(summary, f, indent=2)
+        except Exception as e:
+            print(f"[WARN] Failed to write JSON summary to {args.json_out}: {e}")
 
 if __name__ == "__main__":
     main()

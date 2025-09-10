@@ -35,6 +35,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0, help="Seed for eval")
     p.add_argument("--fast_eval", type=lambda x: str(x).lower() in ["1","true","yes"], default=True, help="CO3D fast eval (10 seqs)")
     p.add_argument("--use_ba", type=lambda x: str(x).lower() in ["1","true","yes"], default=False, help="Enable BA in CO3D eval")
+    p.add_argument("--adjacency_json", type=str, default=None, help="Path to per-scene adjacency JSON (MegaLoc output)")
+    p.add_argument("--max_frames", type=int, default=0, help="Limit number of frames (use only first N images)")
     return p.parse_args()
 
 
@@ -56,14 +58,17 @@ def main():
     image_paths = []
     for e in exts:
         image_paths.extend(sorted(glob(os.path.join(args.image_folder, e))))
+    if args.max_frames and args.max_frames > 0:
+        image_paths = image_paths[: args.max_frames]
     if len(image_paths) == 0:
         raise ValueError(f"No images found under {args.image_folder}")
 
-    # FlexAttention availability probe
+    # FlexAttention availability probe (robust): check submodule import
     flex_available = False
     try:
-        _ = import_module('torch.nn.attention').flex_attention  # type: ignore[attr-defined]
-        flex_available = True
+        import importlib
+        _fa_mod = importlib.import_module('torch.nn.attention.flex_attention')
+        flex_available = hasattr(_fa_mod, 'flex_attention')
     except Exception:
         flex_available = False
 
@@ -87,6 +92,13 @@ def main():
 
     images = load_and_preprocess_images(image_paths).to(device)
 
+    # If external adjacency is provided, set it for the next forward pass
+    if args.adjacency_json and os.path.isfile(args.adjacency_json):
+        try:
+            model.aggregator.set_next_adjacency_from_json(args.adjacency_json, image_paths)
+        except Exception:
+            pass
+
     # Measure runtime and memory
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     if torch.cuda.is_available():
@@ -94,7 +106,7 @@ def main():
 
     start = time.time()
     with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=amp_dtype) if device == "cuda" else torch.autocast("cpu", enabled=False):
+        with torch.amp.autocast("cuda", dtype=amp_dtype) if device == "cuda" else torch.autocast("cpu", enabled=False):
             _ = model(images)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -116,10 +128,22 @@ def main():
         "runtime_s": total_time,
         "peak_VRAM_GB": peak_vram,
         "flex_attention_available": flex_available,
+        "torch_version": torch.__version__,
         # Placeholders for quantitative metrics (computed elsewhere in eval pipeline)
         "pose_AUC": None,
         "depth_RMSE": None,
     }
+
+    # Attach SDPA backend status for debugging Flash usage
+    try:
+        from torch.backends.cuda import sdp_kernel
+        results["sdp_backends"] = {
+            "flash": bool(sdp_kernel.is_flash_sdp_enabled()),
+            "mem_efficient": bool(sdp_kernel.is_mem_efficient_sdp_enabled()),
+            "math": bool(sdp_kernel.is_math_sdp_enabled()),
+        }
+    except Exception:
+        pass
 
     # Attach sparsity info if model computed it
     try:
@@ -165,6 +189,8 @@ def main():
                 "--mask_hub_tokens", str(int(args.mask_hub_tokens)),
                 "--json_out", json_out,
             ]
+            if args.adjacency_json:
+                cmd.extend(["--adjacency_json", args.adjacency_json])
             if args.fast_eval:
                 cmd.append("--fast_eval")
             if args.use_ba:

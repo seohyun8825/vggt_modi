@@ -18,6 +18,7 @@ def parse_args():
     p = argparse.ArgumentParser("VGGT ablation runner")
     p.add_argument("--image_folder", type=str, required=True, help="Path to folder containing only images")
     p.add_argument("--output_dir", type=str, required=True, help="Directory to save logs and metrics")
+    p.add_argument("--runtime_source", type=str, default="forward", choices=["forward", "co3d_eval"], help="What runtime to measure: forward pass on --image_folder or CO3D evaluation")
     p.add_argument("--mask_type", type=str, default="none", choices=["none", "topk", "soft"], help="Global attention masking mode")
     p.add_argument("--topk_neighbors", type=int, default=0, help="Top-K neighbors for masking")
     p.add_argument("--mutual", type=lambda x: str(x).lower() in ["1", "true", "yes"], default=True, help="Use mutual neighbors")
@@ -53,15 +54,16 @@ def main():
     else:
         amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
 
-    # Collect images
-    exts = ["*.png", "*.jpg", "*.jpeg", "*.bmp"]
+    # Collect images only if we will run forward timing
     image_paths = []
-    for e in exts:
-        image_paths.extend(sorted(glob(os.path.join(args.image_folder, e))))
-    if args.max_frames and args.max_frames > 0:
-        image_paths = image_paths[: args.max_frames]
-    if len(image_paths) == 0:
-        raise ValueError(f"No images found under {args.image_folder}")
+    if args.runtime_source == "forward":
+        exts = ["*.png", "*.jpg", "*.jpeg", "*.bmp"]
+        for e in exts:
+            image_paths.extend(sorted(glob(os.path.join(args.image_folder, e))))
+        if args.max_frames and args.max_frames > 0:
+            image_paths = image_paths[: args.max_frames]
+        if len(image_paths) == 0:
+            raise ValueError(f"No images found under {args.image_folder}")
 
     # FlexAttention availability probe (robust): check submodule import
     flex_available = False
@@ -93,7 +95,10 @@ def main():
     agg.soft_mask = args.soft_mask or (args.mask_type == "soft")
     agg.mask_hub_tokens = args.mask_hub_tokens
 
-    images = load_and_preprocess_images(image_paths).to(device)
+    if args.runtime_source == "forward":
+        images = load_and_preprocess_images(image_paths).to(device)
+    else:
+        images = None
 
     # If external adjacency is provided, set it for the next forward pass
     if args.adjacency_json and os.path.isfile(args.adjacency_json):
@@ -103,33 +108,36 @@ def main():
             pass
 
     # Measure runtime and memory
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
+    total_time = 0.0
+    peak_vram = 0.0
+    if args.runtime_source == "forward":
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
-    # Optional warmup to exclude compile time (only when masking enabled)
-    try:
-        if agg.mask_type and agg.mask_type != "none":
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", dtype=amp_dtype) if device == "cuda" else torch.autocast("cpu", enabled=False):
-                    _ = model(images)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
-    except Exception:
-        pass
+        # Optional warmup to exclude compile time (only when masking enabled)
+        try:
+            if agg.mask_type and agg.mask_type != "none":
+                with torch.no_grad():
+                    with torch.amp.autocast("cuda", dtype=amp_dtype) if device == "cuda" else torch.autocast("cpu", enabled=False):
+                        _ = model(images)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
 
-    start = time.time()
-    with torch.no_grad():
-        with torch.amp.autocast("cuda", dtype=amp_dtype) if device == "cuda" else torch.autocast("cpu", enabled=False):
-            _ = model(images)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    total_time = time.time() - start
+        start = time.time()
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", dtype=amp_dtype) if device == "cuda" else torch.autocast("cpu", enabled=False):
+                _ = model(images)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        total_time = time.time() - start
 
-    peak_vram = (
-        (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else 0.0
-    )
+        peak_vram = (
+            (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else 0.0
+        )
 
     results = {
         "experiment": {
@@ -142,6 +150,7 @@ def main():
         },
         "runtime_s": total_time,
         "peak_VRAM_GB": peak_vram,
+        "runtime_source": args.runtime_source,
         "flex_attention_available": flex_available,
         "torch_version": torch.__version__,
         # Placeholders for quantitative metrics (computed elsewhere in eval pipeline)
@@ -204,9 +213,6 @@ def main():
         pass
 
     metrics_path = os.path.join(args.output_dir, "metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(json.dumps(results, indent=2))
 
     # Optionally run CO3D evaluation and append AUCs
     if args.eval_co3d:
@@ -237,7 +243,13 @@ def main():
                 cmd.append("--use_ba")
 
             print(f"[INFO] Running CO3D eval: {' '.join(cmd)}")
+            eval_start = time.time()
             proc = subprocess.run(cmd, capture_output=True, text=True)
+            eval_time = time.time() - eval_start
+            # If runtime_source is co3d_eval, override runtime_s with evaluation time
+            if args.runtime_source == "co3d_eval":
+                results["runtime_s"] = eval_time
+                results["runtime_source"] = "co3d_eval"
             print(proc.stdout)
             if proc.returncode != 0:
                 print("[ERROR] CO3D eval failed:", proc.stderr)
@@ -263,11 +275,23 @@ def main():
             if auc:
                 results["pose_AUC"] = auc.get("Auc_30")
                 results["co3d_eval"] = auc
-                with open(metrics_path, "w") as f:
-                    json.dump(results, f, indent=2)
-                print("[INFO] CO3D AUC appended to metrics.json:", json.dumps(auc, indent=2))
+                print("[INFO] CO3D AUC parsed:", json.dumps(auc, indent=2))
             else:
                 print("[WARN] Could not extract AUC from CO3D eval.")
+            # Nothing else here; final write happens after this block
+
+    # Finalize results and write once
+    if args.runtime_source == "co3d_eval":
+        # Drop forward-specific runtime fields for clarity
+        results.pop("runtime_s", None)
+        results.pop("peak_VRAM_GB", None)
+
+    try:
+        with open(metrics_path, "w") as f:
+            json.dump(results, f, indent=2)
+    except Exception as e:
+        print(f"[WARN] Failed to write metrics: {e}")
+    print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":

@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Allow FlexAttention on long sequences
 export VGGT_ALLOW_FLEX_LARGE_N=${VGGT_ALLOW_FLEX_LARGE_N:-1}
+export VGGT_DEBUG=${VGGT_DEBUG:-0}
 
 CO3D_DIR=${3:-"/workspace/toddler/vggt/co3d_annotations_full"}
 CO3D_ANNO_DIR=${4:-"/workspace/toddler/vggt/co3d_annotations_full"}
 CO3D_CAT=${CO3D_CAT:-apple}
 FWD_IMAGE_DIR=${1:-"examples/kitchen/images"}
-OUTPUT_DIR=${2:-"results/ours_k8"}
-# Which stages to run: forward | eval | both
+OUTPUT_DIR=${2:-"results/softmix_k10"}
 RUN_MODE=${RUN_MODE:-both}
 
 mkdir -p "$OUTPUT_DIR"
@@ -17,13 +16,14 @@ mkdir -p "$OUTPUT_DIR"
 if [[ "$RUN_MODE" == "forward" || "$RUN_MODE" == "both" ]]; then
   OUT_FWD="$OUTPUT_DIR/forward"
   mkdir -p "$OUT_FWD"
-  echo "[RUN] Ours K=8 forward -> $OUT_FWD"
+  echo "[RUN] SoftMix K=10 forward -> $OUT_FWD"
   python tools/run_ablation.py \
     --image_folder "$FWD_IMAGE_DIR" \
     --output_dir "$OUT_FWD" \
-    --mask_type topk \
-    --topk_neighbors 8 \
+    --mask_type soft \
+    --topk_neighbors 10 \
     --mutual true \
+    --soft_mask true \
     --runtime_source forward \
     --eval_co3d 0 \
     2>&1 | tee "$OUT_FWD/log.txt"
@@ -32,13 +32,14 @@ fi
 if [[ "$RUN_MODE" == "eval" || "$RUN_MODE" == "both" ]]; then
   OUT_EVAL="$OUTPUT_DIR/eval"
   mkdir -p "$OUT_EVAL"
-  echo "[RUN] Ours K=8 CO3D eval -> $OUT_EVAL"
+  echo "[RUN] SoftMix K=10 CO3D eval -> $OUT_EVAL"
   python tools/run_ablation.py \
     --image_folder "$FWD_IMAGE_DIR" \
     --output_dir "$OUT_EVAL" \
-    --mask_type topk \
-    --topk_neighbors 8 \
+    --mask_type soft \
+    --topk_neighbors 10 \
     --mutual true \
+    --soft_mask true \
     --runtime_source co3d_eval \
     --eval_co3d 1 \
     --co3d_dir "$CO3D_DIR" \

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Allow FlexAttention on long sequences
+# Force smaller Flex block size to reduce OOM risk
 export VGGT_ALLOW_FLEX_LARGE_N=${VGGT_ALLOW_FLEX_LARGE_N:-1}
+export VGGT_FLEX_BLOCK=64
+export VGGT_DEBUG=${VGGT_DEBUG:-0}
 
 CO3D_DIR=${3:-"/workspace/toddler/vggt/co3d_annotations_full"}
 CO3D_ANNO_DIR=${4:-"/workspace/toddler/vggt/co3d_annotations_full"}
 CO3D_CAT=${CO3D_CAT:-apple}
 FWD_IMAGE_DIR=${1:-"examples/kitchen/images"}
-OUTPUT_DIR=${2:-"results/ours_k8"}
-# Which stages to run: forward | eval | both
+OUTPUT_DIR=${2:-"results/ours_k8_block64"}
 RUN_MODE=${RUN_MODE:-both}
 
 mkdir -p "$OUTPUT_DIR"
@@ -17,7 +18,7 @@ mkdir -p "$OUTPUT_DIR"
 if [[ "$RUN_MODE" == "forward" || "$RUN_MODE" == "both" ]]; then
   OUT_FWD="$OUTPUT_DIR/forward"
   mkdir -p "$OUT_FWD"
-  echo "[RUN] Ours K=8 forward -> $OUT_FWD"
+  echo "[RUN] K=8 block64 forward -> $OUT_FWD"
   python tools/run_ablation.py \
     --image_folder "$FWD_IMAGE_DIR" \
     --output_dir "$OUT_FWD" \
@@ -32,7 +33,7 @@ fi
 if [[ "$RUN_MODE" == "eval" || "$RUN_MODE" == "both" ]]; then
   OUT_EVAL="$OUTPUT_DIR/eval"
   mkdir -p "$OUT_EVAL"
-  echo "[RUN] Ours K=8 CO3D eval -> $OUT_EVAL"
+  echo "[RUN] K=8 block64 CO3D eval -> $OUT_EVAL"
   python tools/run_ablation.py \
     --image_folder "$FWD_IMAGE_DIR" \
     --output_dir "$OUT_EVAL" \

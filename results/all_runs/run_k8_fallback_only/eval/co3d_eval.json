@@ -1,0 +1,29 @@
+{
+  "per_category": {
+    "apple": {
+      "Auc_30": 0.5727407407407408,
+      "Auc_15": 0.39451851851851855,
+      "Auc_5": 0.21955555555555556,
+      "Auc_3": 0.17333333333333334
+    }
+  },
+  "mean": {
+    "Auc_30": 0.5727407407407408,
+    "Auc_15": 0.39451851851851855,
+    "Auc_5": 0.21955555555555556,
+    "Auc_3": 0.17333333333333334
+  },
+  "config": {
+    "model_path": "/workspace/toddler/vggt/model_tracker_fixed_e20.pt",
+    "seed": 0,
+    "fast_eval": true,
+    "use_ba": false,
+    "masking": {
+      "mask_type": "topk",
+      "topk_neighbors": 8,
+      "mutual": true,
+      "soft_mask": false,
+      "mask_hub_tokens": false
+    }
+  }
+}

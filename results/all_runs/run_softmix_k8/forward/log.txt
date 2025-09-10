@@ -1,0 +1,48 @@
+{
+  "experiment": {
+    "mask_type": "soft",
+    "topk_neighbors": 8,
+    "mutual": true,
+    "soft_mask": true,
+    "mask_hub_tokens": false,
+    "weights": "/workspace/toddler/vggt/model_tracker_fixed_e20.pt"
+  },
+  "runtime_s": 2.3591034412384033,
+  "peak_VRAM_GB": 17.13766574859619,
+  "runtime_source": "forward",
+  "flex_attention_available": true,
+  "torch_version": "2.6.0+cu124",
+  "pose_AUC": null,
+  "depth_RMSE": null,
+  "sparsity": {
+    "S": 25,
+    "P": 930,
+    "N": 23250,
+    "hubs_per_frame": 5,
+    "nonhub_per_frame": 925,
+    "total_pairs": 540562500,
+    "allowed_pairs": 177304500,
+    "sparsity": 0.328,
+    "adj_density": 0.3279999792575836,
+    "mask_type": "soft",
+    "topk_neighbors": 8,
+    "mutual": true,
+    "soft_mask": true,
+    "mask_hub_tokens": false,
+    "used_flex_attention": false,
+    "used_sparse_context": true,
+    "fallback_reason": "gate_use_flex_false"
+  },
+  "telemetry": {
+    "used_flex_attention": false,
+    "used_sparse_context": true,
+    "entered_sparse": true,
+    "adj_is_none": false,
+    "soft_mask": true,
+    "mask_hub_tokens": false,
+    "q_len_init": 23250,
+    "flex_import_ok": true,
+    "fallback_reason": "gate_use_flex_false",
+    "took_fallback_chunked": true
+  }
+}

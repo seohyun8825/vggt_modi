@@ -1,0 +1,105 @@
+[INFO] Running CO3D eval: /root/miniconda3/envs/vggt/bin/python /workspace/toddler/vggt/evaluation/test_co3d.py --model_path /workspace/toddler/vggt/model_tracker_fixed_e20.pt --co3d_dir /workspace/toddler/vggt/co3d_annotations_full --co3d_anno_dir /workspace/toddler/vggt/co3d_annotations_full --seed 0 --mask_type soft --topk_neighbors 8 --mutual 1 --soft_mask 1 --mask_hub_tokens 0 --json_out results/all_runs/run_softmix_k8/eval/co3d_eval.json --fast_eval
+Initializing and loading VGGT model...
+USING /workspace/toddler/vggt/model_tracker_fixed_e20.pt
+Loading annotation for apple test set
+Testing Sequences: 
+['151_16771_32072', '272_29069_57147', '308_32484_61563', '350_36616_67878', '350_36686_68258', '350_36780_68727', '360_37802_71331', '360_37806_71737', '360_37811_71312', '622_102411_205731']
+--------------------------------------------------
+Processing 151_16771_32072 for apple test set
+Image ids [  5  12  18  98 107 146 152 171 178 183]
+apple sequence 151_16771_32072 R_ACC@5: 0.3778
+apple sequence 151_16771_32072 T_ACC@5: 0.3333
+--------------------------------------------------
+--------------------------------------------------
+Processing 272_29069_57147 for apple test set
+Image ids [ 40  47  52  54  57  78 110 115 132 150]
+apple sequence 272_29069_57147 R_ACC@5: 0.2889
+apple sequence 272_29069_57147 T_ACC@5: 0.2889
+--------------------------------------------------
+--------------------------------------------------
+Processing 308_32484_61563 for apple test set
+Image ids [ 34  49  85 141 147 149 156 180 190 193]
+apple sequence 308_32484_61563 R_ACC@5: 0.1778
+apple sequence 308_32484_61563 T_ACC@5: 0.2667
+--------------------------------------------------
+--------------------------------------------------
+Processing 350_36616_67878 for apple test set
+Image ids [ 22  27  40  79  98 104 136 142 158 169]
+apple sequence 350_36616_67878 R_ACC@5: 0.2667
+apple sequence 350_36616_67878 T_ACC@5: 0.3111
+--------------------------------------------------
+--------------------------------------------------
+Processing 350_36686_68258 for apple test set
+Image ids [ 12  27  58  76 105 134 162 165 177 195]
+apple sequence 350_36686_68258 R_ACC@5: 0.2889
+apple sequence 350_36686_68258 T_ACC@5: 0.2000
+--------------------------------------------------
+--------------------------------------------------
+Processing 350_36780_68727 for apple test set
+Image ids [ 24  35  46  92 109 110 141 151 168 179]
+apple sequence 350_36780_68727 R_ACC@5: 0.2444
+apple sequence 350_36780_68727 T_ACC@5: 0.3556
+--------------------------------------------------
+--------------------------------------------------
+Processing 360_37802_71331 for apple test set
+Image ids [  6  31  41  90 111 125 143 172 184 200]
+apple sequence 360_37802_71331 R_ACC@5: 0.2444
+apple sequence 360_37802_71331 T_ACC@5: 0.3111
+--------------------------------------------------
+--------------------------------------------------
+Processing 360_37806_71737 for apple test set
+Image ids [  8  44  58  92 124 156 163 174 191 195]
+apple sequence 360_37806_71737 R_ACC@5: 0.2222
+apple sequence 360_37806_71737 T_ACC@5: 0.2444
+--------------------------------------------------
+--------------------------------------------------
+Processing 360_37811_71312 for apple test set
+Image ids [ 44  69  70 100 124 138 146 168 173 183]
+apple sequence 360_37811_71312 R_ACC@5: 0.2222
+apple sequence 360_37811_71312 T_ACC@5: 0.2667
+--------------------------------------------------
+--------------------------------------------------
+Processing 622_102411_205731 for apple test set
+Image ids [ 13  38  56  84 143 148 150 155 156 174]
+apple sequence 622_102411_205731 R_ACC@5: 0.2222
+apple sequence 622_102411_205731 T_ACC@5: 0.0667
+--------------------------------------------------
+================================================================================
+[1m[94mAUC of apple test set:[0m [92m0.4315 (AUC@30), 0.2508 (AUC@15), 0.0956 (AUC@5), 0.0459 (AUC@3)[0m
+[1m[94mMean AUC of categories by now:[0m [91m0.4315 (AUC@30), 0.2508 (AUC@15), 0.0956 (AUC@5), 0.0459 (AUC@3)[0m
+================================================================================
+
+Summary of AUC results:
+--------------------------------------------------
+apple          : 0.4315 (AUC@30), 0.2508 (AUC@15), 0.0956 (AUC@5), 0.0459 (AUC@3)
+--------------------------------------------------
+Mean AUC: 0.4315 (AUC@30), 0.2508 (AUC@15), 0.0956 (AUC@5), 0.0459 (AUC@3)
+/workspace/toddler/vggt/model_tracker_fixed_e20.pt
+
+[INFO] CO3D AUC parsed: {
+  "Auc_30": 0.4314814814814814,
+  "Auc_15": 0.25081481481481477,
+  "Auc_5": 0.09555555555555555,
+  "Auc_3": 0.045925925925925926
+}
+{
+  "experiment": {
+    "mask_type": "soft",
+    "topk_neighbors": 8,
+    "mutual": true,
+    "soft_mask": true,
+    "mask_hub_tokens": false,
+    "weights": "/workspace/toddler/vggt/model_tracker_fixed_e20.pt"
+  },
+  "runtime_source": "co3d_eval",
+  "flex_attention_available": true,
+  "torch_version": "2.6.0+cu124",
+  "pose_AUC": 0.4314814814814814,
+  "depth_RMSE": null,
+  "co3d_eval": {
+    "Auc_30": 0.4314814814814814,
+    "Auc_15": 0.25081481481481477,
+    "Auc_5": 0.09555555555555555,
+    "Auc_3": 0.045925925925925926
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "experiment": {
+    "mask_type": "soft",
+    "topk_neighbors": 8,
+    "mutual": true,
+    "soft_mask": true,
+    "mask_hub_tokens": false,
+    "weights": "/workspace/toddler/vggt/model_tracker_fixed_e20.pt"
+  },
+  "runtime_source": "co3d_eval",
+  "flex_attention_available": true,
+  "torch_version": "2.6.0+cu124",
+  "pose_AUC": 0.4314814814814814,
+  "depth_RMSE": null,
+  "co3d_eval": {
+    "Auc_30": 0.4314814814814814,
+    "Auc_15": 0.25081481481481477,
+    "Auc_5": 0.09555555555555555,
+    "Auc_3": 0.045925925925925926
+  }
+}

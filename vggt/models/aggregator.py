@@ -592,20 +592,53 @@ class Aggregator(nn.Module):
         adj_tensor = None
         bias_tensor = None
 
+        # Helper: map JSON images -> current order indices (by basename)
+        json_images = []
+        json_index = {}
+        if isinstance(data, dict) and 'images' in data and isinstance(data['images'], list):
+            try:
+                json_images = [os.path.splitext(os.path.basename(p))[0] for p in data['images']]
+                json_index = {b: i for i, b in enumerate(json_images)}
+            except Exception:
+                json_images = []
+                json_index = {}
+
         if isinstance(data, dict) and 'adjacency' in data:
             import torch as _torch
             A = data['adjacency']
             try:
-                adj_tensor = _torch.tensor(A, dtype=_torch.bool, device=self.camera_token.device)
+                At_raw = _torch.tensor(A, dtype=_torch.bool, device=self.camera_token.device)
+                if At_raw.ndim == 2 and len(json_index) == At_raw.shape[0] == At_raw.shape[1] and len(json_index) > 0:
+                    # Reorder/subset to current sequence order via basename mapping
+                    try:
+                        sel = [json_index.get(b, -1) for b in bases]
+                        if all(i >= 0 for i in sel) and len(set(sel)) == S:
+                            adj_tensor = At_raw[sel][:, sel]
+                    except Exception:
+                        adj_tensor = None
+                else:
+                    # If no images mapping present or shape mismatch, ignore adjacency to avoid S mismatch
+                    adj_tensor = None
             except Exception:
-                pass
+                adj_tensor = None
         if isinstance(data, dict) and 'bias' in data:
             import torch as _torch
             B = data['bias']
             try:
-                bias_tensor = _torch.tensor(B, dtype=_torch.float32, device=self.camera_token.device)
+                Bt_raw = _torch.tensor(B, dtype=_torch.float32, device=self.camera_token.device)
+                if Bt_raw.ndim == 2 and len(json_index) == Bt_raw.shape[0] == Bt_raw.shape[1] and len(json_index) > 0:
+                    try:
+                        sel = [json_index.get(b, -1) for b in bases]
+                        if all(i >= 0 for i in sel) and len(set(sel)) == S:
+                            bias_tensor = Bt_raw[sel][:, sel]
+                        else:
+                            bias_tensor = None
+                    except Exception:
+                        bias_tensor = None
+                else:
+                    bias_tensor = None
             except Exception:
-                pass
+                bias_tensor = None
         if isinstance(data, dict) and 'neighbors' in data and (adj_tensor is None or bias_tensor is None):
             import torch as _torch
             nbrs = data['neighbors']
@@ -642,8 +675,20 @@ class Aggregator(nn.Module):
             adj_tensor = adj_tensor.clone()
             adj_tensor.fill_diagonal_(True)
 
+        # Determine whether we have a usable graph/bias of correct shape
+        used = False
+        try:
+            S = len(image_paths)
+            if adj_tensor is not None and adj_tensor.ndim == 2 and adj_tensor.shape[0] == S and adj_tensor.shape[1] == S:
+                used = True
+            if bias_tensor is not None and bias_tensor.ndim == 2 and bias_tensor.shape[0] == S and bias_tensor.shape[1] == S:
+                used = True or used
+        except Exception:
+            used = False
+
         # Set for next call
         self.set_next_adjacency(adjacency=adj_tensor, bias=bias_tensor)
+        return used
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

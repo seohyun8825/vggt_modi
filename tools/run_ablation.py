@@ -37,7 +37,15 @@ def parse_args():
     p.add_argument("--fast_eval", type=lambda x: str(x).lower() in ["1","true","yes"], default=True, help="CO3D fast eval (10 seqs)")
     p.add_argument("--use_ba", type=lambda x: str(x).lower() in ["1","true","yes"], default=False, help="Enable BA in CO3D eval")
     p.add_argument("--adjacency_json", type=str, default=None, help="Path to per-scene adjacency JSON (MegaLoc output)")
+    p.add_argument("--adjacency_json_dir", type=str, default=None, help="Directory of per-sequence adjacency JSONs for CO3D eval (category/seq.json)")
     p.add_argument("--max_frames", type=int, default=0, help="Limit number of frames (use only first N images)")
+    p.add_argument("--co3d_num_frames", type=int, default=None, help="Override --num_frames for CO3D eval (default in test_co3d.py is 10)")
+    # Eval-time adjacency builder backend options
+    p.add_argument("--adj_provider", type=str, default="megaloc",
+                   choices=["megaloc", "resnet50", "fallback"],
+                   help="Descriptor backend for building eval-time adjacency")
+    p.add_argument("--adj_device", type=str, default="cuda",
+                   help="Device for descriptor model used during eval (e.g., cuda or cpu)")
     return p.parse_args()
 
 
@@ -235,12 +243,32 @@ def main():
                 "--mask_hub_tokens", str(int(args.mask_hub_tokens)),
                 "--json_out", json_out,
             ]
+            # If user provides a directory of per-sequence adjacency JSONs, pass it through for strict matching
+            if args.adjacency_json_dir:
+                cmd.extend(["--adjacency_json_dir", args.adjacency_json_dir])
+            # Legacy single JSON support
             if args.adjacency_json:
                 cmd.extend(["--adjacency_json", args.adjacency_json])
+            elif not args.adjacency_json_dir:
+                # If no external JSON is provided, build per-sequence adjacency automatically
+                # using lightweight descriptors. This ensures eval always has a valid graph order.
+                cmd.extend(["--adj_provider", args.adj_provider, "--adj_device", args.adj_device])
+                cmd.extend([
+                    "--auto_adj_build", "1",
+                    "--adj_topk", str(args.topk_neighbors),
+                    "--adj_mutual", str(int(args.mutual)),
+                    "--adj_soft_bias", str(int(args.soft_mask)),
+                ])
             if args.fast_eval:
                 cmd.append("--fast_eval")
             if args.use_ba:
                 cmd.append("--use_ba")
+            if args.co3d_num_frames is not None:
+                cmd.extend(["--num_frames", str(args.co3d_num_frames)])
+                if args.topk_neighbors >= args.co3d_num_frames - 1 and args.mask_type != "soft":
+                    print(
+                        f"[WARN] topk_neighbors={args.topk_neighbors}  num_frames-1={args.co3d_num_frames-1}; adjacency will be dense."
+                    )
 
             print(f"[INFO] Running CO3D eval: {' '.join(cmd)}")
             eval_start = time.time()

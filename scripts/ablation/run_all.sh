@@ -18,27 +18,33 @@ CO3D_ANNO_DIR=${CO3D_ANNO_DIR:-/workspace/toddler/vggt/co3d_annotations_full}
 export RUN_MODE
 
 scripts=(
-  run_baseline.sh
-  run_ours_k2.sh
-  run_ours_k4.sh
-  run_ours_k8.sh
-  run_ours_k8_nomutual.sh
-  run_ours_k10.sh
-  run_ours_k10_nomutual.sh
-  run_ours_k12.sh
-  run_ours_k12_nomutual.sh
-  run_ours_k14.sh
-  run_ours_k14_nomutual.sh
-  run_ours_k16.sh
-  run_ours_masked_hub.sh
-  run_ours_softmask.sh
-  run_ours_window2.sh
-  run_ours_window4.sh
-  run_softmix_k8.sh
-  run_softmix_k10.sh
-  run_softmix_k12.sh
+  # run_baseline.sh
+  # run_ours_k2.sh
+  # run_ours_k4.sh
+  # run_ours_k8.sh
+  # run_ours_k8_nomutual.sh
+  # run_ours_k10.sh
+  # run_ours_k10_nomutual.sh
+  # run_ours_k12.sh
+  # run_ours_k12_nomutual.sh
+  # run_ours_k14.sh
+  # run_ours_k14_nomutual.sh
+  # run_ours_k16.sh
+  # run_ours_masked_hub.sh
+  # run_ours_softmask.sh
+  # run_ours_window2.sh
+  # run_ours_window4.sh
+  # run_softmix_k8.sh
+  # run_softmix_k10.sh
+  # run_softmix_k12.sh
   run_k8_block64.sh
   run_k8_fallback_only.sh
+  run_co3d_k8_megaloc.sh
+  run_co3d_k8_resnet50.sh
+  run_co3d_k8_nomutual.sh
+  run_co3d_k8_hybrid_w2.sh
+  run_co3d_k8_softbias.sh
+  run_co3d_k8_hybrid_w2_softbias.sh
 )
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"

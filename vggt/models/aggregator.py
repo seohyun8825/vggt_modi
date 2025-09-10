@@ -413,6 +413,12 @@ class Aggregator(nn.Module):
         if hasattr(self, "last_sparsity_info") and isinstance(self.last_sparsity_info, dict):
             self.last_sparsity_info["used_flex_attention"] = bool(telemetry.get("used_flex_attention", False))
             self.last_sparsity_info["used_sparse_context"] = bool(telemetry.get("used_sparse_context", False))
+            # Attach fallback_reason if any
+            if "fallback_reason" in telemetry:
+                self.last_sparsity_info["fallback_reason"] = telemetry.get("fallback_reason")
+
+        # Store full telemetry for external logging
+        self.last_telemetry = telemetry
 
         return tokens, global_idx, intermediates
 

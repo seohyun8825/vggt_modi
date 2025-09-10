@@ -11,6 +11,7 @@ import logging
 import os
 import warnings
 import math
+import hashlib
 import torch
 
 from torch import Tensor
@@ -21,6 +22,15 @@ XFORMERS_AVAILABLE = False
 
 # Env override: allow FlexAttention at large sequence lengths (may OOM!)
 _ALLOW_FLEX_LARGE_N = str(os.getenv("VGGT_ALLOW_FLEX_LARGE_N", "0")).lower() in ("1", "true", "yes")
+
+# Cache for BlockMask objects to avoid expensive re-creation
+_BLOCK_MASK_CACHE: dict[tuple, object] = {}
+
+# Optional override for FlexAttention block size in tokens
+try:
+    _FLEX_BLOCK_OVERRIDE = int(os.getenv("VGGT_FLEX_BLOCK", "0"))
+except Exception:
+    _FLEX_BLOCK_OVERRIDE = 0
 
 
 class Attention(nn.Module):
@@ -158,8 +168,31 @@ class GlobalSparseAttention(Attention):
         soft_mask = bool(ctx.get('soft_mask', False))
         frame_bias = ctx.get('frame_bias', None)  # (S,S) float or None
 
-        # Telemetry holder (optional)
+        # Telemetry (debug) holder
         telemetry = ctx.get('telemetry', None)
+        if telemetry is None:
+            telemetry = {}
+            ctx['telemetry'] = telemetry
+        telemetry.update({
+            'entered_sparse': True,
+            'adj_is_none': adj is None,
+            'soft_mask': bool(soft_mask),
+            'mask_hub_tokens': bool(mask_hub_tokens),
+            'q_len_init': int(N),
+        })
+
+        def _dbg(msg: str, **kw):
+            telemetry.update(kw)
+            if os.getenv("VGGT_DEBUG", "0").lower() in ("1", "true", "yes"):
+                try:
+                    print(f"[VGGT][GlobalSparseAttention] {msg} :: {kw}")
+                except Exception:
+                    pass
+
+        def _fail_fallback(reason: str):
+            telemetry['fallback_reason'] = reason
+            if os.getenv("VGGT_FAIL_ON_FALLBACK", "0").lower() in ("1", "true", "yes"):
+                raise RuntimeError(f"Forced fail on fallback: {reason}")
 
         # Try to import FlexAttention, handling both function and submodule forms
         flex_fn = None
@@ -174,6 +207,9 @@ class GlobalSparseAttention(Attention):
                 flex_fn = getattr(_mod, 'flex_attention', None)
             except Exception:
                 flex_fn = None
+        telemetry['flex_import_ok'] = bool(flex_fn)
+        if not telemetry['flex_import_ok']:
+            _dbg("Flex import failed")
 
         # If no actual masking is requested, route to dense SDPA/Flash
         if (adj is None) and (not mask_hub_tokens) and (not soft_mask) and (frame_bias is None):
@@ -189,23 +225,30 @@ class GlobalSparseAttention(Attention):
                 telemetry['used_flex_attention'] = False
             return self._fallback_chunked_sparse(x, pos, attn_mask)
 
-        # Decide Flex vs chunked fallback conservatively to avoid dense math path
-        N_total = N  # sequence length per batch element
+        # Decide Flex vs chunked fallback. Try Flex when available and adjacency is provided.
+        # Optional global disable via env
+        _disable_flex_env = str(os.getenv("VGGT_DISABLE_FLEX", "0")).lower() in ("1", "true", "yes")
+        # Avoid repeated OOMs within the same module instance
+        if not hasattr(self, "_flex_failed_once"):
+            self._flex_failed_once = False
+
         use_flex = (
             (flex_fn is not None)
             and (adj is not None)          # must have adjacency (top-k) to be worthwhile
             and (not soft_mask)            # soft-only tends to trigger dense path
-            and ((N_total <= 4096) or _ALLOW_FLEX_LARGE_N)  # allow override via env
         )
+        if _disable_flex_env or self._flex_failed_once:
+            use_flex = False
         if not use_flex:
             if isinstance(telemetry, dict):
                 telemetry['used_sparse_context'] = True
                 telemetry['used_flex_attention'] = False
+            _fail_fallback("gate_use_flex_false")
             return self._fallback_chunked_sparse(x, pos, attn_mask)
         else:
             if isinstance(telemetry, dict):
                 telemetry['used_sparse_context'] = True
-                telemetry['used_flex_attention'] = True
+                telemetry['used_flex_attention'] = False  # will set True after successful flex call
 
         if frame_ids is None or is_hub is None:
             # Not enough info, fallback
@@ -261,43 +304,259 @@ class GlobalSparseAttention(Attention):
             return torch.where(allowed, score_plus, neg_inf)
 
         # Run FlexAttention with a proper BlockMask to enforce block-sparse compute
-        flex_kwargs = {"score_mod": score_mod}
+        # Only pass score_mod when features beyond adjacency are required
+        use_score_mod = bool(soft_mask) or bool(mask_hub_tokens)
+        flex_kwargs = {"score_mod": score_mod} if use_score_mod else {}
+        created_block_mask = False
         if adj is not None:
+            # Derive S and P from frame_ids (tokens per frame is uniform)
+            S0 = int(frame_ids.max().item()) + 1  # real frames (before padding)
+            assert N % S0 == 0, f"Sequence length N={N} must be divisible by frames S0={S0}"
+            P = int(N // S0)
+
+            # Choose 128-aligned block sizes for fast Flex kernels (override via env)
+            QBS = KBS = int(_FLEX_BLOCK_OVERRIDE) if _FLEX_BLOCK_OVERRIDE > 0 else 128
+            BLOCK_SIZE = (QBS, KBS)
+            telemetry.update({'QBS': int(QBS), 'KBS': int(KBS)})
+
+            # 2.6 compatibility shim: pad to N_pad multiple of 128 so BlockMask shape matches q/k/v
+            orig_N = int(N)
+            N_pad = int(((N + QBS - 1) // QBS) * QBS)
+            do_pad = (N_pad != N)
+            if do_pad:
+                pad_len = N_pad - N
+                Bq, Hq, Dh = q.shape[0], q.shape[1], q.shape[-1]
+                # pad q/k/v with zeros at the end along sequence dim
+                q_pad = q.new_zeros((Bq, Hq, N_pad, Dh)); q_pad[:, :, :N, :] = q; q = q_pad
+                k_pad = k.new_zeros((Bq, Hq, N_pad, Dh)); k_pad[:, :, :N, :] = k; k = k_pad
+                v_pad = v.new_zeros((Bq, Hq, N_pad, Dh)); v_pad[:, :, :N, :] = v; v = v_pad
+                # pad frame_ids with a dummy frame id S0
+                frame_ids_pad = torch.empty(N_pad, dtype=frame_ids.dtype, device=frame_ids.device)
+                frame_ids_pad[:N] = frame_ids
+                frame_ids_pad[N:] = int(S0)
+                frame_ids = frame_ids_pad
+                # ensure is_hub has padded zeros for dummy tokens
+                if is_hub is None:
+                    is_hub = torch.zeros(N_pad, dtype=torch.bool, device=device)
+                else:
+                    if is_hub.numel() != N_pad:
+                        is_hub_pad = torch.zeros(N_pad, dtype=is_hub.dtype, device=is_hub.device)
+                        is_hub_pad[:N] = is_hub
+                        is_hub = is_hub_pad
+                # expand adjacency with dummy row/col all False
+                adj_bool0 = adj.to(torch.bool)
+                adj_pad = torch.zeros((S0 + 1, S0 + 1), dtype=torch.bool, device=adj_bool0.device)
+                adj_pad[:S0, :S0] = adj_bool0
+                adj = adj_pad
+                # logical frame count increases by 1 (dummy frame)
+                S = S0 + 1
+                N = N_pad
+            else:
+                S = S0
+            telemetry.update({'do_pad': bool(do_pad), 'N_pad': int(N), 'S0': int(S0), 'P': int(P)})
             try:
-                from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
-
-                hub_flag = torch.tensor(mask_hub_tokens, dtype=torch.bool, device=q.device)
-
-                def mask_mod(b: torch.Tensor, h: torch.Tensor, qi: torch.Tensor, kj: torch.Tensor):
-                    fi = frame_ids[qi]
-                    fj = frame_ids[kj]
-                    # adjacency allow
-                    adj_val = adj[fi, fj]
-                    adj_allowed = adj_val if adj_val.dtype == torch.bool else (adj_val != 0)
-                    # hub rule: allow when same frame OR neither token is hub; disable only if flag is on
-                    hub_q = is_hub[qi]
-                    hub_k = is_hub[kj]
-                    same_frame = (fi == fj)
-                    neither_hub = ~(hub_q | hub_k)
-                    hub_allowed = (~hub_flag) | (same_frame | neither_hub)
-                    return adj_allowed & hub_allowed
-
-                # BLOCK_SIZE in tokens; since tokens are grouped per-frame with size P, use (P,P)
-                block_mask = _create_block_mask(
-                    mask_mod,
-                    B=q.shape[0],
-                    H=q.shape[1],
-                    Q_LEN=N,
-                    KV_LEN=N,
-                    device=q.device,
-                    BLOCK_SIZE=(int(P), int(P)),
-                )
-                flex_kwargs["block_mask"] = block_mask
+                telemetry['frame_ids_max'] = int(frame_ids.max().item())
+                telemetry['frame_ids_len'] = int(frame_ids.numel())
             except Exception:
                 pass
 
+            # Try robust import for BlockMask
+            _BlockMask = None
+            try:
+                from torch.nn.attention.flex_attention import BlockMask as _BM  # type: ignore[attr-defined]
+                _BlockMask = _BM
+            except Exception:
+                try:
+                    import importlib
+                    _mod = importlib.import_module('torch.nn.attention.flex_attention')
+                    _BlockMask = getattr(_mod, 'BlockMask', None)
+                except Exception:
+                    _BlockMask = None
+            telemetry['blockmask_import_ok'] = bool(_BlockMask)
+            if not telemetry['blockmask_import_ok']:
+                _dbg("BlockMask import failed")
+                _fail_fallback("no_blockmask_class")
+
+            if _BlockMask is not None:
+                # Build BlockMask on a 128-token block grid by mapping frame adjacency onto block indices
+                adj_bool = adj.to(torch.bool)
+                # ensure square and diagonal allowed
+                if adj_bool.shape != (S, S):
+                    if isinstance(telemetry, dict):
+                        telemetry['used_sparse_context'] = True
+                        telemetry['used_flex_attention'] = False
+                    _fail_fallback("adj_shape_mismatch")
+                    return self._fallback_chunked_sparse(x, pos, attn_mask)
+                if (~adj_bool.diagonal()).any():
+                    adj_bool = adj_bool.clone()
+                    adj_bool.fill_diagonal_(True)
+                # record diagonal check
+                try:
+                    telemetry['adj_diag_all_true'] = bool(torch.all(torch.diag(adj_bool)))
+                except Exception:
+                    pass
+
+                # Compute number of query/kv blocks for 128-sized tiles
+                Q_blocks = (N + QBS - 1) // QBS
+                KV_blocks = (N + KBS - 1) // KBS
+                telemetry.update({'Q_blocks': int(Q_blocks), 'KV_blocks': int(KV_blocks)})
+
+                # For each query block, compute which frames it overlaps (robust via frame_ids)
+                blk_start = torch.arange(Q_blocks, device=device, dtype=torch.int32) * QBS
+                blk_end = torch.minimum(blk_start + QBS, torch.tensor(N, device=device, dtype=torch.int32))
+                qf_start = frame_ids[blk_start.to(torch.long)]
+                qf_endm1 = frame_ids[(blk_end - 1).to(torch.long)]
+
+                row0 = adj_bool[qf_start]  # [Q_blocks, S]
+                same = (qf_endm1 == qf_start).unsqueeze(1)
+                row1 = torch.where(same, torch.zeros_like(row0), adj_bool[qf_endm1])
+                kv_frames_allowed = (row0 | row1)  # [Q_blocks, S]
+
+                # Map allowed frames to KV block index ranges
+                frames_real = torch.arange(S0, device=device)
+                frame_st_blk_real = ((frames_real * P) // KBS).to(torch.int32)  # [S0]
+                frame_ed_blk_real = ((((frames_real + 1) * P + KBS - 1) // KBS) - 1).to(torch.int32)  # [S0]
+                if do_pad:
+                    st_blk_pad = torch.tensor(int(N // KBS), device=device, dtype=torch.int32)
+                    ed_blk_pad = torch.tensor(int((N - 1) // KBS), device=device, dtype=torch.int32)
+                    # padded region spans [N_pad - pad_len, N_pad), but since N was updated to N_pad, start index of pad is orig_N
+                    st_blk_pad = torch.tensor(int(orig_N // KBS), device=device, dtype=torch.int32)
+                    ed_blk_pad = torch.tensor(int((N_pad - 1) // KBS), device=device, dtype=torch.int32)
+                    frame_st_blk = torch.cat([frame_st_blk_real, st_blk_pad.view(1)])
+                    frame_ed_blk = torch.cat([frame_ed_blk_real, ed_blk_pad.view(1)])
+                else:
+                    frame_st_blk = frame_st_blk_real
+                    frame_ed_blk = frame_ed_blk_real
+
+                kv_indices = torch.full((Q_blocks, KV_blocks), -1, dtype=torch.int32, device=device)
+                kv_counts = torch.zeros(Q_blocks, dtype=torch.int32, device=device)
+
+                # Note: Q_blocks is typically modest (e.g., ~N/128). Simple Python loop is acceptable.
+                for qb in range(int(Q_blocks)):
+                    allow_frames = torch.nonzero(kv_frames_allowed[qb], as_tuple=True)[0]
+                    if allow_frames.numel() == 0:
+                        allow_frames = qf_start[qb:qb+1]
+                    # Gather block ranges and take union
+                    starts = frame_st_blk[allow_frames]
+                    ends = frame_ed_blk[allow_frames]
+                    blocks_list = []
+                    for s_blk, e_blk in zip(starts.tolist(), ends.tolist()):
+                        if e_blk >= s_blk:
+                            blocks_list.append(torch.arange(s_blk, e_blk + 1, device=device, dtype=torch.int32))
+                    if len(blocks_list) > 0:
+                        block_ids = torch.unique(torch.cat(blocks_list), sorted=True)
+                        n = int(block_ids.numel())
+                        kv_indices[qb, :n] = block_ids
+                        kv_counts[qb] = n
+
+                # kv_counts stats for debugging
+                try:
+                    telemetry['kv_counts_min'] = int(kv_counts.min().item())
+                    telemetry['kv_counts_max'] = int(kv_counts.max().item())
+                    telemetry['kv_counts_mean'] = float(kv_counts.float().mean().item())
+                    telemetry['kv_counts_p95'] = int(torch.quantile(kv_counts.float(), 0.95).item())
+                except Exception:
+                    pass
+
+                # Estimate density and available memory; optionally early-fallback if too dense
+                try:
+                    avg_k_blocks = float(kv_counts.float().mean().item()) if kv_counts.numel() > 0 else 0.0
+                    est_k_per_q = avg_k_blocks * float(KBS)
+                    est_density = float(est_k_per_q / float(N)) if N > 0 else 1.0
+                    telemetry['est_density'] = est_density
+                    if torch.cuda.is_available():
+                        free_b, total_b = torch.cuda.mem_get_info()
+                        telemetry['cuda_free_GB'] = float(free_b / (1024**3))
+                        telemetry['cuda_total_GB'] = float(total_b / (1024**3))
+                    # Experience-based guard: if too dense, prefer fallback
+                    if est_density > 0.30:
+                        _fail_fallback("est_density_high")
+                        return self._fallback_chunked_sparse(x, pos, attn_mask)
+                except Exception:
+                    pass
+
+                # Build BlockMask (prefer seq_lengths if available)
+                kv_num_blocks = kv_counts.view(1, 1, int(Q_blocks))
+                kv_indices_4d = kv_indices.view(1, 1, int(Q_blocks), int(KV_blocks))
+
+                def _adj_fingerprint(t: torch.Tensor) -> str:
+                    try:
+                        tb = t.to(torch.bool).to(torch.uint8).contiguous().cpu().numpy().tobytes()
+                        return hashlib.sha1(tb).hexdigest()
+                    except Exception:
+                        return f"S{S}_nnz{int(t.to(torch.bool).sum().item())}"
+
+                kv_cols = int(kv_indices_4d.shape[-1])
+                cache_key = (int(N), int(S0), int(P), BLOCK_SIZE, kv_cols, _adj_fingerprint(adj_bool))
+
+                block_mask = _BLOCK_MASK_CACHE.get(cache_key)
+
+                if block_mask is None:
+                    try:
+                        import inspect
+                        sig = inspect.signature(_BlockMask.from_kv_blocks)
+                        if 'seq_lengths' in sig.parameters:
+                            block_mask = _BlockMask.from_kv_blocks(
+                                kv_num_blocks,
+                                kv_indices_4d,
+                                BLOCK_SIZE=BLOCK_SIZE,
+                                seq_lengths=(int(N), int(N)),
+                            )
+                        else:
+                            block_mask = _BlockMask.from_kv_blocks(
+                                kv_num_blocks,
+                                kv_indices_4d,
+                                BLOCK_SIZE=BLOCK_SIZE,
+                            )
+                    except Exception:
+                        block_mask = _BlockMask.from_kv_blocks(
+                            kv_num_blocks,
+                            kv_indices_4d,
+                            BLOCK_SIZE=BLOCK_SIZE,
+                        )
+                    _BLOCK_MASK_CACHE[cache_key] = block_mask
+
+                # Record BlockMask shape for debugging (do not pre-fallback)
+                try:
+                    bm_q, bm_k = getattr(block_mask, 'shape', (None, None))
+                    telemetry['block_mask_shape'] = (int(bm_q), int(bm_k))
+                except Exception:
+                    telemetry['block_mask_shape'] = None
+
+                flex_kwargs["block_mask"] = block_mask
+                created_block_mask = True
+
+        # If we couldn't create a block_mask, fall back to chunked sparse to avoid dense Flex OOM
+        if not created_block_mask:
+            if isinstance(telemetry, dict):
+                telemetry['used_sparse_context'] = True
+                telemetry['used_flex_attention'] = False
+            _fail_fallback("no_blockmask_built")
+            return self._fallback_chunked_sparse(x, pos, attn_mask)
+
         # Execute FlexAttention. It expects [B, H, N, Dh]
-        out = flex_fn(q, k, v, **flex_kwargs)
+        try:
+            out = flex_fn(q, k, v, **flex_kwargs)
+            # If padded, slice back to original N before projection
+            if 'do_pad' in locals() and do_pad:
+                out = out[:, :, :orig_N, :]
+                N = orig_N
+            if isinstance(telemetry, dict):
+                telemetry['used_flex_attention'] = True
+                telemetry['fallback_reason'] = None
+        except Exception as e:
+            # Mark this module as failed once to avoid repeated OOM retries
+            self._flex_failed_once = True
+            if isinstance(telemetry, dict):
+                telemetry['used_sparse_context'] = True
+                telemetry['used_flex_attention'] = False
+                try:
+                    telemetry['flex_error'] = str(e)[:400]
+                except Exception:
+                    pass
+            _dbg("FlexAttention raised, fallback", error=str(e)[:160])
+            _fail_fallback("flex_call_exception")
+            return self._fallback_chunked_sparse(x, pos, ctx)
         out = out.transpose(1, 2).reshape(B, N, C)
         out = self.proj(out)
         out = self.proj_drop(out)
@@ -307,6 +566,13 @@ class GlobalSparseAttention(Attention):
         """Fallback path when FlexAttention is unavailable.
         Implements per-frame chunked SDPA with small per-chunk masks, avoiding NxN.
         """
+        telemetry = None
+        try:
+            telemetry = ctx.get('telemetry', None) if isinstance(ctx, dict) else None
+        except Exception:
+            telemetry = None
+        if isinstance(telemetry, dict):
+            telemetry['took_fallback_chunked'] = True
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)

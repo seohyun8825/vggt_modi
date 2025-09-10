@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Allow FlexAttention on long sequences
+export VGGT_ALLOW_FLEX_LARGE_N=${VGGT_ALLOW_FLEX_LARGE_N:-1}
+
 IMAGE_DIR=${1:-"examples/kitchen/images"}
 OUTPUT_DIR=${2:-"results/ours_k16"}
 CO3D_DIR=${3:-"/workspace/toddler/vggt/co3d_annotations_full"}
@@ -19,4 +22,3 @@ python tools/run_ablation.py \
   --co3d_anno_dir "$CO3D_ANNO_DIR" \
   --fast_eval 1 \
   2>&1 | tee "$OUTPUT_DIR/log.txt"
-

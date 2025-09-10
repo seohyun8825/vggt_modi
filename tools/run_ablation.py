@@ -82,6 +82,9 @@ def main():
     else:
         model = VGGT().to(device)
 
+    # Inference/ablation runs: ensure eval mode to avoid checkpointing overhead
+    model.eval()
+
     # Apply masking flags after construction/load so eval uses same "방법론"
     agg = model.aggregator
     agg.mask_type = args.mask_type
@@ -103,6 +106,18 @@ def main():
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
+    # Optional warmup to exclude compile time (only when masking enabled)
+    try:
+        if agg.mask_type and agg.mask_type != "none":
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=amp_dtype) if device == "cuda" else torch.autocast("cpu", enabled=False):
+                    _ = model(images)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
 
     start = time.time()
     with torch.no_grad():
@@ -136,16 +151,25 @@ def main():
 
     # Attach SDPA backend status for debugging Flash usage
     try:
-        from torch.backends.cuda import sdp_kernel
-        results["sdp_backends"] = {
-            "flash": bool(sdp_kernel.is_flash_sdp_enabled()),
-            "mem_efficient": bool(sdp_kernel.is_mem_efficient_sdp_enabled()),
-            "math": bool(sdp_kernel.is_math_sdp_enabled()),
-        }
+        # Try legacy API name
+        from torch.backends.cuda import sdp_kernel as _sdp
     except Exception:
-        pass
+        try:
+            # Newer API may be named sdpa_kernel
+            from torch.backends.cuda import sdpa_kernel as _sdp  # type: ignore
+        except Exception:
+            _sdp = None
+    if _sdp is not None:
+        try:
+            results["sdp_backends"] = {
+                "flash": bool(_sdp.is_flash_sdp_enabled()),
+                "mem_efficient": bool(_sdp.is_mem_efficient_sdp_enabled()),
+                "math": bool(_sdp.is_math_sdp_enabled()),
+            }
+        except Exception:
+            pass
 
-    # Attach sparsity info if model computed it
+    # Attach sparsity info & telemetry if model computed it
     try:
         agg = model.aggregator
         sparse_info = getattr(agg, 'last_sparsity_info', None)
@@ -160,6 +184,22 @@ def main():
                         pass
                 clean[k] = v
             results["sparsity"] = clean
+        telemetry = getattr(agg, 'last_telemetry', None)
+        if isinstance(telemetry, dict):
+            tel_clean = {}
+            for k, v in telemetry.items():
+                if hasattr(v, 'item'):
+                    try:
+                        v = v.item()
+                    except Exception:
+                        pass
+                elif isinstance(v, (tuple, list)):
+                    try:
+                        v = [int(x) if hasattr(x, 'item') else (int(x) if isinstance(x, int) else x) for x in v]
+                    except Exception:
+                        pass
+                tel_clean[k] = v
+            results["telemetry"] = tel_clean
     except Exception:
         pass
 
